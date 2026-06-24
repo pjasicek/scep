@@ -42,6 +42,7 @@ struct scep {
     int NID_SCEP_extensionReq;
 
     X509 *cert;
+    X509_CRL *crl;
     EVP_PKEY *pkey;
     const EVP_MD *md;
     STACK_OF(X509) *chain;
@@ -67,6 +68,12 @@ struct scep_pkiMessage {
     enum messageType messageType;
 
     struct scep_pkiMessage_attributes auth_attr; /* Owned by this->pkcs7 */
+};
+
+struct scep_CertId {
+    const struct scep_pkiMessage *m; /* Owns this */
+
+    PKCS7_ISSUER_AND_SERIAL *ias; /* Owned by this */
 };
 
 struct scep_PKCSReq {
@@ -273,6 +280,10 @@ void scep_free(struct scep *scep)
 
     if (scep->store) {
         X509_STORE_free(scep->store);
+    }
+
+    if (scep->crl) {
+        X509_CRL_free(scep->crl);
     }
 
     if (scep->chain) { /* Signing cert is included */
@@ -539,6 +550,61 @@ int scep_load_other_ca_certificate(
         return -1;
     }
 
+    return 0;
+}
+
+int scep_load_crl(
+        struct scep *scep,
+        const char *crlfile,
+        int crlpem)
+{
+    EVP_PKEY *pkey;
+    X509_CRL *crl;
+    X509_NAME *issuer;
+    X509_NAME *subject;
+    BIO *bp;
+    int nid;
+
+    if (!scep || !scep->cert || scep->crl) {
+        return -1;
+    }
+
+    bp = BIO_new_file(crlfile, "rb");
+    if (!bp) {
+        return -1;
+    }
+
+    if (crlpem) {
+        crl = PEM_read_bio_X509_CRL(bp, NULL, NULL, NULL);
+    } else {
+        crl = d2i_X509_CRL_bio(bp, NULL);
+    }
+
+    BIO_free_all(bp);
+    if (!crl) {
+        return -1;
+    }
+
+    nid = X509_CRL_get_signature_nid(crl);
+    if (scep_check_signature_algo(nid)) {
+        X509_CRL_free(crl);
+        return -1;
+    }
+
+    issuer = X509_CRL_get_issuer(crl);
+    subject = X509_get_subject_name(scep->cert);
+    if (!issuer || !subject || X509_NAME_cmp(issuer, subject)) {
+        X509_CRL_free(crl);
+        return -1;
+    }
+
+    pkey = X509_get0_pubkey(scep->cert);
+    if (!pkey || X509_CRL_verify(crl, pkey) != 1) {
+        X509_CRL_free(crl);
+        return -1;
+    }
+
+    scep->crl = crl;
     return 0;
 }
 
@@ -1328,6 +1394,101 @@ static int scep_verify(X509_STORE *store, X509 *subject)
     return 1;
 }
 
+struct scep_CertId *scep_CertId_new(
+        struct scep *scep,
+        struct scep_pkiMessage *m)
+{
+    struct scep_pkiMessage_attributes *a;
+    PKCS7_ISSUER_AND_SERIAL *ias;
+    struct scep_CertId *id;
+    const unsigned char *end;
+    const unsigned char *p;
+    BUF_MEM *bptr;
+
+    if (!scep || !scep->cert || !m) {
+        return NULL;
+    }
+
+    a = &m->auth_attr;
+    if (!a->transactionID || !a->messageType || !a->senderNonce) {
+        LOGD("scep: CertId: missing contain mandatory attributes");
+        return NULL;
+    } else if (a->senderNonce->length != 16) {
+        LOGD("scep: CertId: senderNonce length is non-standard: %d",
+                a->senderNonce->length);
+        /* But continue to proceed */
+    }
+
+    BIO_get_mem_ptr(m->payload, &bptr);
+    if (!bptr || !bptr->data || bptr->length == 0) {
+        LOGD("scep: CertId: empty issuer and serial");
+        return NULL;
+    }
+
+    p = (const unsigned char *)bptr->data;
+    end = p + bptr->length;
+
+    ias = d2i_PKCS7_ISSUER_AND_SERIAL(NULL, &p, (long)bptr->length);
+    if (!ias || p != end || !ias->issuer || !ias->serial) {
+        LOGD("scep: CertId: missing valid issuer and serial");
+        PKCS7_ISSUER_AND_SERIAL_free(ias);
+        return NULL;
+    }
+
+    id = (struct scep_CertId *)malloc(sizeof(*id));
+    if (!id) {
+        PKCS7_ISSUER_AND_SERIAL_free(ias);
+        return NULL;
+    }
+
+    LOGD("scep: CertId: successfully parsed");
+    memset(id, 0, sizeof(*id));
+    id->ias = ias;
+    id->m = m;
+    return id;
+}
+
+void scep_CertId_free(struct scep_CertId *id)
+{
+    if (!id) {
+        return;
+    }
+
+    if (id->ias) {
+        PKCS7_ISSUER_AND_SERIAL_free(id->ias);
+    }
+
+    free(id);
+}
+
+int scep_CertId_matches_crl(
+        struct scep *scep,
+        const struct scep_CertId *id)
+{
+    X509_NAME *issuer;
+    int ret;
+
+    if (!scep || !id || !id->ias || !id->ias->issuer) {
+        return -1;
+    }
+
+    if (!scep->crl) {
+        return 0;
+    }
+
+    issuer = X509_CRL_get_issuer(scep->crl);
+    if (!issuer) {
+        return -1;
+    }
+
+    ret = X509_NAME_cmp(id->ias->issuer, issuer);
+    if (ret == -2) {
+        return -1;
+    }
+
+    return ret == 0;
+}
+
 struct scep_PKCSReq *scep_PKCSReq_new(
         struct scep *scep,
         struct scep_pkiMessage *m)
@@ -1755,6 +1916,62 @@ static int scep_degenerate_chain(BIO *bp, STACK_OF(X509) *certs)
     return 0;
 }
 
+static int scep_degenerate_crl(BIO *bp, X509_CRL *crl)
+{
+    STACK_OF(X509_CRL) *crls;
+    PKCS7_SIGNED *p7s;
+    PKCS7 *pkcs7;
+
+    crls = sk_X509_CRL_new_null();
+    if (!crls) {
+        return -1;
+    }
+
+    if (sk_X509_CRL_push(crls, crl) <= 0) {
+        sk_X509_CRL_free(crls);
+        return -1;
+    }
+
+    pkcs7 = PKCS7_new();
+    if (!pkcs7) {
+        sk_X509_CRL_free(crls);
+        return -1;
+    }
+
+    if (PKCS7_set_type(pkcs7, NID_pkcs7_signed) != 1) {
+        sk_X509_CRL_free(crls);
+        PKCS7_free(pkcs7);
+        return -1;
+    }
+
+    p7s = pkcs7->d.sign;
+    if (ASN1_INTEGER_set(p7s->version, 1) != 1) {
+        sk_X509_CRL_free(crls);
+        PKCS7_free(pkcs7);
+        return -1;
+    }
+
+    p7s->contents->type = OBJ_nid2obj(NID_pkcs7_data);
+    if (!p7s->contents->type) {
+        sk_X509_CRL_free(crls);
+        PKCS7_free(pkcs7);
+        return -1;
+    }
+
+    p7s->crl = crls;
+    if (i2d_PKCS7_bio(bp, pkcs7) != 1) {
+        p7s->crl = NULL;
+        sk_X509_CRL_free(crls);
+        PKCS7_free(pkcs7);
+        return -1;
+    }
+
+    p7s->crl = NULL;
+    sk_X509_CRL_free(crls);
+    PKCS7_free(pkcs7);
+    return 0;
+}
+
 static int scep_degenerate_va(BIO *bp, va_list ap)
 {
     STACK_OF(X509) *chain;
@@ -1826,6 +2043,59 @@ static int scep_CertRep_set_SAN(X509_REQ *req, X509 *subject)
     return ret;
 }
 
+static PKCS7 *scep_CertRep_seal_message(
+        struct scep *scep,
+        const struct scep_pkiMessage *m,
+        const char *pkiStatus,
+        const char *failInfo,
+        BIO *payload)
+{
+    struct scep_pkiMessage_attributes auth_attr;
+    PKCS7 *pkcs7;
+
+    if (!scep || !m) {
+        return NULL;
+    }
+
+    memset(&auth_attr, 0, sizeof(auth_attr));
+    auth_attr.transactionID = ASN1_STRING_dup(m->auth_attr.transactionID);
+    auth_attr.messageType = scep_printable_string("3");
+    auth_attr.pkiStatus = scep_printable_string(pkiStatus);
+    auth_attr.senderNonce = scep_nonce();
+    auth_attr.recipientNonce = ASN1_STRING_dup(m->auth_attr.senderNonce);
+
+    if (failInfo) {
+        auth_attr.failInfo = scep_printable_string(failInfo);
+    }
+
+    if (!auth_attr.transactionID          ||
+        !auth_attr.messageType            ||
+        !auth_attr.senderNonce            ||
+        !auth_attr.recipientNonce         ||
+        !auth_attr.pkiStatus              ||
+        (failInfo && !auth_attr.failInfo) ){
+
+        scep_pkiMessage_attributes_cleanup(&auth_attr);
+        return NULL;
+    }
+
+    pkcs7 = scep_pkiMessage_seal(
+            scep,
+            payload,
+            m->signer,
+            scep->cert,
+            scep->pkey,
+            &auth_attr);
+
+    if (!pkcs7) {
+        scep_pkiMessage_attributes_cleanup(&auth_attr);
+        return NULL;
+    }
+
+    scep_pkiMessage_attributes_cleanup(&auth_attr);
+    return pkcs7;
+}
+
 static PKCS7 *scep_CertRep_seal(
         struct scep *scep,
         struct scep_PKCSReq *req,
@@ -1833,7 +2103,6 @@ static PKCS7 *scep_CertRep_seal(
         const char *failInfo,
         X509 *subject)
 {
-    struct scep_pkiMessage_attributes auth_attr;
     PKCS7 *pkcs7;
     BIO *payload;
 
@@ -1850,45 +2119,13 @@ static PKCS7 *scep_CertRep_seal(
         }
     }
 
-    memset(&auth_attr, 0, sizeof(auth_attr));
-    auth_attr.transactionID = ASN1_STRING_dup(req->m->auth_attr.transactionID);
-    auth_attr.messageType = scep_printable_string("3");
-    auth_attr.pkiStatus = scep_printable_string(pkiStatus);
-    auth_attr.senderNonce = scep_nonce();
-    auth_attr.recipientNonce = ASN1_STRING_dup(req->m->auth_attr.senderNonce);
+    pkcs7 = scep_CertRep_seal_message(
+            scep, req->m, pkiStatus, failInfo, payload);
 
-    if (failInfo) {
-        auth_attr.failInfo = scep_printable_string(failInfo);
-    }
-
-    if (!auth_attr.transactionID          ||
-        !auth_attr.messageType            ||
-        !auth_attr.senderNonce            ||
-        !auth_attr.recipientNonce         ||
-        !auth_attr.pkiStatus              ||
-        (failInfo && !auth_attr.failInfo) ){
-
-        scep_pkiMessage_attributes_cleanup(&auth_attr);
+    if (payload) {
         BIO_free_all(payload);
-        return NULL;
     }
 
-    pkcs7 = scep_pkiMessage_seal(
-            scep,
-            payload,
-            req->m->signer,
-            scep->cert,
-            scep->pkey,
-            &auth_attr);
-
-    if (!pkcs7) {
-        scep_pkiMessage_attributes_cleanup(&auth_attr);
-        BIO_free_all(payload);
-        return NULL;
-    }
-
-    scep_pkiMessage_attributes_cleanup(&auth_attr);
-    BIO_free_all(payload);
     return pkcs7;
 }
 
@@ -1977,6 +2214,18 @@ struct scep_CertRep *scep_CertRep_new(
     return rep;
 }
 
+static const char *scep_failInfo_string(enum failInfo why)
+{
+    switch (why) {
+    case failInfo_badAlg         : return "0";
+    case failInfo_badMessageCheck: return "1";
+    case failInfo_badRequest     : return "2";
+    case failInfo_badTime        : return "3";
+    case failInfo_badCertId      : return "4";
+    default                      : return NULL;
+    }
+}
+
 struct scep_CertRep *scep_CertRep_reject(
         struct scep *scep, struct scep_PKCSReq *req, enum failInfo why)
 {
@@ -1992,17 +2241,79 @@ struct scep_CertRep *scep_CertRep_reject(
         return NULL;
     }
 
-    switch (why) {
-    case failInfo_badAlg         : failInfo =  "0"; break;
-    case failInfo_badMessageCheck: failInfo =  "1"; break;
-    case failInfo_badRequest     : failInfo =  "2"; break;
-    case failInfo_badTime        : failInfo =  "3"; break;
-    case failInfo_badCertId      : failInfo =  "4"; break;
-    default                      : failInfo = NULL; break;
+    failInfo = scep_failInfo_string(why);
+    memset(rep, 0, sizeof(*rep));
+    rep->pkcs7 = scep_CertRep_seal(scep, req, "2", failInfo, NULL);
+    if (!rep->pkcs7) {
+        free(rep);
+        return NULL;
+    }
+
+    return rep;
+}
+
+struct scep_CertRep *scep_CertRep_new_crl(
+        struct scep *scep,
+        struct scep_CertId *id)
+{
+    struct scep_CertRep *rep;
+    BIO *payload;
+
+    if (!scep || !scep->cert || !scep->pkey || !scep->crl || !id) {
+        return NULL;
+    }
+
+    payload = BIO_new(BIO_s_mem());
+    if (!payload) {
+        return NULL;
+    }
+
+    if (scep_degenerate_crl(payload, scep->crl)) {
+        BIO_free_all(payload);
+        return NULL;
+    }
+
+    rep = (struct scep_CertRep *)malloc(sizeof(*rep));
+    if (!rep) {
+        BIO_free_all(payload);
+        return NULL;
     }
 
     memset(rep, 0, sizeof(*rep));
-    rep->pkcs7 = scep_CertRep_seal(scep, req, "2", failInfo, NULL);
+    rep->pkcs7 = scep_CertRep_seal_message(
+            scep, id->m, "0", NULL, payload);
+
+    BIO_free_all(payload);
+    if (!rep->pkcs7) {
+        free(rep);
+        return NULL;
+    }
+
+    return rep;
+}
+
+struct scep_CertRep *scep_CertRep_reject_certid(
+        struct scep *scep,
+        struct scep_CertId *id,
+        enum failInfo why)
+{
+    struct scep_CertRep *rep;
+    const char *failInfo;
+
+    if (!scep || !scep->cert || !scep->pkey || !id) {
+        return NULL;
+    }
+
+    rep = (struct scep_CertRep *)malloc(sizeof(*rep));
+    if (!rep) {
+        return NULL;
+    }
+
+    failInfo = scep_failInfo_string(why);
+    memset(rep, 0, sizeof(*rep));
+    rep->pkcs7 = scep_CertRep_seal_message(
+            scep, id->m, "2", failInfo, NULL);
+
     if (!rep->pkcs7) {
         free(rep);
         return NULL;
@@ -2073,6 +2384,19 @@ int scep_get_cert(struct scep *scep, BIO *bp)
     }
 
     return num;
+}
+
+int scep_get_crl(struct scep *scep, BIO *bp)
+{
+    if (!scep || !scep->crl || !bp) {
+        return -1;
+    }
+
+    if (i2d_X509_CRL_bio(bp, scep->crl) != 1) {
+        return -1;
+    }
+
+    return 0;
 }
 
 const ASN1_PRINTABLESTRING *scep_PKCSReq_get_challengePassword(

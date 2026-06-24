@@ -9,6 +9,7 @@ extern "C" {
 #endif
 
 struct scep;
+struct scep_CertId;
 struct scep_PKCSReq;
 struct scep_CertRep;
 struct scep_pkiMessage;
@@ -71,11 +72,18 @@ extern int scep_load_other_ca_certificate(
         const char *certfile,
         int certpem);
 
+extern int scep_load_crl(
+        struct scep *scep,
+        const char *crlfile,
+        int crlpem);
+
 extern int scep_load_subject_extensions(
         struct scep *scep, const char *filename);
 
 /* Returns number of certificates included, or -1 for error */
 extern int scep_get_cert(struct scep *scep, BIO *bp);
+
+extern int scep_get_crl(struct scep *scep, BIO *bp);
 
 extern struct scep_pkiMessage *scep_pkiMessage_new(struct scep *scep, BIO *bp);
 
@@ -83,6 +91,15 @@ extern enum messageType scep_pkiMessage_get_type(
         const struct scep_pkiMessage *m);
 
 extern void scep_pkiMessage_free(struct scep_pkiMessage *m);
+
+/* Returned object is owned by caller, but references pkiMessage */
+extern struct scep_CertId *scep_CertId_new(
+        struct scep *scep, struct scep_pkiMessage *m);
+
+extern void scep_CertId_free(struct scep_CertId *id);
+
+extern int scep_CertId_matches_crl(
+        struct scep *scep, const struct scep_CertId *id);
 
 /* Returned object is owned by scep_pkiMessage, don't free it */
 extern struct scep_PKCSReq *scep_PKCSReq_new(
@@ -118,6 +135,15 @@ extern struct scep_CertRep *scep_CertRep_new_with(
 extern struct scep_CertRep *scep_CertRep_reject(
         struct scep *scep,
         struct scep_PKCSReq *req,
+        enum failInfo why);
+
+extern struct scep_CertRep *scep_CertRep_new_crl(
+        struct scep *scep,
+        struct scep_CertId *id);
+
+extern struct scep_CertRep *scep_CertRep_reject_certid(
+        struct scep *scep,
+        struct scep_CertId *id,
         enum failInfo why);
 
 #ifdef __cplusplus

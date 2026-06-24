@@ -592,6 +592,22 @@ static unsigned int handle_GetCACert(
     return MHD_HTTP_OK;
 }
 
+static unsigned int handle_GetCRL_raw(
+        struct context *ctx,
+        BIO *payload,
+        const char **rct,
+        BIO *response)
+{
+    (void)payload;
+
+    if (scep_get_crl(ctx->scep, response)) {
+        return MHD_HTTP_NOT_FOUND;
+    }
+
+    *rct = "application/pkix-crl";
+    return MHD_HTTP_OK;
+}
+
 static int save_subject(
         struct scep_CertRep *rep,
         const ASN1_PRINTABLESTRING *cp)
@@ -664,6 +680,48 @@ static int save_subject(
     return 0;
 }
 
+static unsigned int handle_GetCRL(
+        struct context *ctx,
+        struct scep_pkiMessage *m,
+        const char **rct,
+        BIO *response)
+{
+    struct scep_CertRep *rep;
+    struct scep_CertId *id;
+    int match;
+
+    id = scep_CertId_new(ctx->scep, m);
+    if (!id) {
+        return MHD_HTTP_BAD_REQUEST;
+    }
+
+    match = scep_CertId_matches_crl(ctx->scep, id);
+    if (match < 0) {
+        scep_CertId_free(id);
+        return MHD_HTTP_INTERNAL_SERVER_ERROR;
+    } else if (match == 0) {
+        LOGW("scep: GetCRL requested unknown issuer or no CRL configured");
+        rep = scep_CertRep_reject_certid(ctx->scep, id, failInfo_badCertId);
+    } else {
+        LOGI("scep: GetCRL matched configured CRL");
+        rep = scep_CertRep_new_crl(ctx->scep, id);
+    }
+
+    scep_CertId_free(id);
+    if (!rep) {
+        return MHD_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (scep_CertRep_save(rep, response)) {
+        scep_CertRep_free(rep);
+        return MHD_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    scep_CertRep_free(rep);
+    *rct = "application/x-pki-message";
+    return MHD_HTTP_OK;
+}
+
 static unsigned int handle_PKIOperation(
         struct context *ctx,
         BIO *payload,
@@ -700,6 +758,10 @@ static unsigned int handle_PKIOperation(
     case messageType_RenewalReq:
     case messageType_PKCSReq:
         break;
+    case messageType_GetCRL:
+        ret = handle_GetCRL(ctx, m, rct, response);
+        scep_pkiMessage_free(m);
+        return ret;
     default:
         scep_pkiMessage_free(m);
         return MHD_HTTP_BAD_REQUEST;
@@ -824,6 +886,8 @@ static unsigned int handle(
         return handle_GetCACaps(ctx, payload, rct, response);
     } else if (strcmp(operation, "GetCACert") == 0) {
         return handle_GetCACert(ctx, payload, rct, response);
+    } else if (strcmp(operation, "GetCRL") == 0) {
+        return handle_GetCRL_raw(ctx, payload, rct, response);
     } else if (strcmp(operation, "PKIOperation") == 0) {
         return handle_PKIOperation(ctx, payload, rct, response);
     } else {
@@ -865,6 +929,7 @@ static int help(const char *argv)
                       " [-V validity_days=90]"
                       " [-d /some/where/depot]"
                       " [-R allow_renew_days=14]"
+                      " [-r crl] [-q PEM|DER=PEM]"
                       " [-e extension.cnf]\n", argv);
 
     fprintf(stderr, "%s <-C challenge>"
@@ -969,12 +1034,13 @@ int main(int argc, char *argv[])
     int cfrm;
     int lfrm;
     int kfrm;
+    int rfrm;
     int ofrm;
     int san;
     int ret;
     int c;
 
-    static const char *kOptString = "p:c:k:f:F:P:C:V:R:S:d:e:l:L:o:O:ETAh";
+    static const char *kOptString = "p:c:k:f:F:P:C:V:R:S:d:e:l:L:o:O:r:q:ETAh";
     static const struct option kLongOpts[] = {
         { "port",       required_argument, NULL, 'p' },
         { "ca",         required_argument, NULL, 'c' },
@@ -992,6 +1058,8 @@ int main(int argc, char *argv[])
         { "chainform",  required_argument, NULL, 'L' },
         { "otherca",    required_argument, NULL, 'o' },
         { "othercaform",required_argument, NULL, 'O' },
+        { "crl",        required_argument, NULL, 'r' },
+        { "crlform",    required_argument, NULL, 'q' },
         { "trans_id",   no_argument,       NULL, 'T' },
         { "exposed_cp", no_argument,       NULL, 'E' },
         { "set_san",    no_argument,       NULL, 'A' },
@@ -1007,6 +1075,7 @@ int main(int argc, char *argv[])
     const char *arg_sjct = NULL;
     const char *arg_exts = NULL;
     const char *arg_dpot = NULL;
+    const char *arg_crl  = NULL;
 
     const char *arg_link[8];
     const char *arg_lfrm[8];
@@ -1020,6 +1089,7 @@ int main(int argc, char *argv[])
     const char *arg_renw = "14";
     const char *arg_cfrm = "pem";
     const char *arg_kfrm = "pem";
+    const char *arg_rfrm = "pem";
 
     san = 0;
     exposed = 0;
@@ -1048,6 +1118,8 @@ int main(int argc, char *argv[])
         case 'S': arg_sjct = optarg; break;
         case 'd': arg_dpot = optarg; break;
         case 'e': arg_exts = optarg; break;
+        case 'r': arg_crl  = optarg; break;
+        case 'q': arg_rfrm = optarg; break;
         case 'E': exposed  =      1; break;
         case 'T': trans_id =      1; break;
         case 'A': san      =      1; break;
@@ -1099,7 +1171,8 @@ int main(int argc, char *argv[])
         atodays(arg_days, &ctx.validity_days)    ||
         atodays(arg_renw, &ctx.allow_renew_days) ||
         atoform(arg_cfrm, &cfrm)                 ||
-        atoform(arg_kfrm, &kfrm)                 ){
+        atoform(arg_kfrm, &kfrm)                 ||
+        atoform(arg_rfrm, &rfrm)                 ){
 
         return help(argv[0]);
     }
@@ -1122,6 +1195,13 @@ int main(int argc, char *argv[])
 
         scep_free(scep);
         return EXIT_FAILURE;
+    }
+
+    if (arg_crl) {
+        if (scep_load_crl(scep, arg_crl, rfrm)) {
+            scep_free(scep);
+            return EXIT_FAILURE;
+        }
     }
 
     for (i = 0; i < arg_links; ++i) {

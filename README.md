@@ -18,6 +18,8 @@ You start by getting the signing CA certificate and key, this can be a self-sign
 
 Other than specifying validity on the command line, issued certificates can have customized extensions by supplying a configure file containing key=value pairs similar to OpenSSL configure syntax.
 
+If you already generate a CRL for the signing CA, the daemon can serve that static CRL through SCEP `GetCRL`. Revocation and CRL generation are still handled outside this daemon.
+
 An automated authorization can be configured so that the SCEP client must present a challenge password, which is generated based on a secret passphrase and the subject as a pre-authorization. This challenge password is expired 7 days after generation.
 
 To start with you can just invoke the server by:
@@ -104,6 +106,8 @@ Note that it requires the signing CA certificate to have keyid in `SubjectKeyIde
 |-L|--chainform=\<pem\|der\>|pem|Specify the same number of times as chained CA if needed.|
 |-o|--otherca=\<other.cer\>|(none)|When the client renews its certificate with an existing certificate, the daemon will check if that certificate was issued by the signing CA itself. Specifying additional CA certificates so the client certificate is validated against all of them. The specified CA certificates are formed as a CA store thus every certificate is a trust anchor. Since the client might not provide the whole certificate chain, it's recommended to include all previously active signing CAs so the validation is more stable.|
 |-O|--otherform=\<pem\|der\>|pem|Specify the same number of times as other CA if needed.|
+|-r|--crl=\<crl\>|(none)|Load a static CRL for the signing CA and return it for matching SCEP GetCRL requests. The CRL issuer must match the signing CA subject and its signature must verify with the signing CA public key.|
+|-q|--crlform=\<pem\|der\>|pem|Static CRL file format.|
 |-T|--trans_id|(unchecked)|Enable Transaction ID check in the requests. Note that only a subset of allowed Transaction ID methods (as in RFC5280 and RFC7093) are supported, so you might want to disable this check if you have client requests rejected.|
 |-E|--exposed_cp|(enforced)|Challenge passwords shall be encrypted in the inner payload of PKCS/7 envelope otherwise they can be eavesdropped and hijacked. However not all the clients properly implement this requirements and might cause security concerns so by default the daemon will reject such requests. Specifying this argument turns off this check. *NOT RECOMMENDED* |
 |-A|--set_san|(discarded)|CSR can contain Subject Alternative Name (SAN) which can be copied to the newly issued certificates, however such SANs are not protected by challenge passwords and the clients can request any SAN that they want, so by default the daemon will not copy them. Specifying this argument allows such copying.|
